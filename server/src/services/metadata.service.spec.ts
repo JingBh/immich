@@ -59,6 +59,20 @@ const makeFaceTags = (face: Partial<{ Name: string }> = {}, orientation?: Immich
   },
 });
 
+const box = (type: string, payload = Buffer.alloc(0)) => {
+  const header = Buffer.alloc(8);
+  header.writeUInt32BE(header.byteLength + payload.byteLength);
+  header.write(type, 4, 'ascii');
+  return Buffer.concat([header, payload]);
+};
+
+const mp4 = (moovPayload = Buffer.alloc(0)) =>
+  Buffer.concat([
+    box('ftyp', Buffer.concat([Buffer.from('mp42'), Buffer.alloc(4), Buffer.from('isommp42')])),
+    box('moov', moovPayload),
+    box('mdat', randomBytes(8)),
+  ]);
+
 describe(MetadataService.name, () => {
   let sut: MetadataService;
   let mocks: ServiceMocks;
@@ -786,6 +800,114 @@ describe(MetadataService.name, () => {
         name: JobName.AssetEncodeVideo,
         data: { id: motionAsset.id },
       });
+    });
+
+    it('should extract a motion photo video from a JPEG trailing MP4 without motion photo tags', async () => {
+      const asset = AssetFactory.create();
+      const motionAsset = AssetFactory.create({ type: AssetType.Video, visibility: AssetVisibility.Hidden });
+      const video = mp4();
+      const tail = Buffer.concat([Buffer.from([0xff, 0xd9]), video]);
+      const size = tail.byteLength;
+      mocks.storage.stat.mockResolvedValue({
+        size,
+        mtime: asset.fileModifiedAt,
+        mtimeMs: asset.fileModifiedAt.valueOf(),
+        birthtimeMs: asset.fileCreatedAt.valueOf(),
+      } as Stats);
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValue(getForMetadataExtraction(asset));
+      mockReadTags({
+        Directory: 'foo/bar/',
+        FileType: 'JPEG',
+      });
+      mocks.storage.readFile.mockImplementation((path, options) => {
+        if (path === asset.originalPath && options?.length === 2) {
+          return Promise.resolve(Buffer.from([0, 0]));
+        }
+
+        return Promise.resolve(tail);
+      });
+      mocks.crypto.hashSha1.mockReturnValue(randomBytes(512));
+      mocks.asset.create.mockResolvedValue(motionAsset);
+      mocks.crypto.randomUUID.mockReturnValue(motionAsset.id);
+
+      await sut.handleMetadataExtraction({ id: asset.id });
+
+      expect(mocks.storage.readFile).toHaveBeenCalledWith(asset.originalPath, {
+        buffer: Buffer.alloc(2),
+        position: size - 2,
+        length: 2,
+      });
+      expect(mocks.storage.readFile).toHaveBeenCalledWith(asset.originalPath, {
+        buffer: Buffer.alloc(tail.byteLength),
+        position: size - tail.byteLength,
+        length: tail.byteLength,
+      });
+      expect(mocks.crypto.hashSha1).toHaveBeenCalledWith(video);
+      expect(mocks.storage.createFile).toHaveBeenCalledWith(motionAsset.originalPath, video);
+      expect(mocks.asset.update).toHaveBeenCalledWith({
+        id: asset.id,
+        livePhotoVideoId: motionAsset.id,
+      });
+    });
+
+    it('should ignore a JPEG trailer without a valid MP4', async () => {
+      const asset = AssetFactory.create();
+      const tail = Buffer.concat([Buffer.from([0xff, 0xd9]), box('ftyp', Buffer.from('mp42'))]);
+      const size = tail.byteLength;
+      mocks.storage.stat.mockResolvedValue({
+        size,
+        mtime: asset.fileModifiedAt,
+        mtimeMs: asset.fileModifiedAt.valueOf(),
+        birthtimeMs: asset.fileCreatedAt.valueOf(),
+      } as Stats);
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValue(getForMetadataExtraction(asset));
+      mockReadTags({
+        Directory: 'foo/bar/',
+        FileType: 'JPEG',
+      });
+      mocks.storage.readFile.mockImplementation((path, options) => {
+        if (path === asset.originalPath && options?.length === 2) {
+          return Promise.resolve(Buffer.from([0, 0]));
+        }
+
+        return Promise.resolve(tail);
+      });
+
+      await sut.handleMetadataExtraction({ id: asset.id });
+
+      expect(mocks.crypto.hashSha1).not.toHaveBeenCalled();
+      expect(mocks.storage.createFile).not.toHaveBeenCalled();
+      expect(mocks.asset.update).not.toHaveBeenCalledWith({
+        id: asset.id,
+        livePhotoVideoId: expect.any(String),
+      });
+    });
+
+    it('should not scan a JPEG file that ends with an image end marker', async () => {
+      const asset = AssetFactory.create();
+      const size = 512;
+      mocks.storage.stat.mockResolvedValue({
+        size,
+        mtime: asset.fileModifiedAt,
+        mtimeMs: asset.fileModifiedAt.valueOf(),
+        birthtimeMs: asset.fileCreatedAt.valueOf(),
+      } as Stats);
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValue(getForMetadataExtraction(asset));
+      mockReadTags({
+        Directory: 'foo/bar/',
+        FileType: 'JPEG',
+      });
+      mocks.storage.readFile.mockResolvedValue(Buffer.from([0xff, 0xd9]));
+
+      await sut.handleMetadataExtraction({ id: asset.id });
+
+      expect(mocks.storage.readFile).toHaveBeenCalledExactlyOnceWith(asset.originalPath, {
+        buffer: Buffer.alloc(2),
+        position: size - 2,
+        length: 2,
+      });
+      expect(mocks.crypto.hashSha1).not.toHaveBeenCalled();
+      expect(mocks.storage.createFile).not.toHaveBeenCalled();
     });
 
     it('should delete old motion photo video assets if they do not match what is extracted', async () => {

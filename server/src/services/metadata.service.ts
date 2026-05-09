@@ -41,6 +41,10 @@ import { Tasks } from 'src/utils/tasks';
 
 const POSTGRES_INT_MAX = 2_147_483_647;
 const POSTGRES_INT_MIN = -2_147_483_648;
+const JPEG_END_MARKER = Buffer.from([0xff, 0xd9]);
+const MAX_TRAILING_MP4_SCAN_BYTES = 64 * 1024 * 1024;
+const MAX_TRAILING_MP4_PRIVATE_BYTES = 1024 * 1024;
+const MP4_BRANDS = ['mp41', 'mp42', 'isom', 'iso2'];
 
 /** look for a date from these tags (in order) */
 const EXIF_DATE_TAGS: Array<keyof ImmichTags> = [
@@ -602,8 +606,137 @@ export class MetadataService extends BaseService {
     );
   }
 
-  private isMotionPhoto(asset: { type: AssetType }, tags: ImmichTags): boolean {
-    return asset.type === AssetType.Image && !!(tags.MotionPhoto || tags.MicroVideo);
+  private isMotionPhoto(asset: { originalPath: string; type: AssetType }, tags: ImmichTags): boolean {
+    return (
+      asset.type === AssetType.Image &&
+      (!!(tags.MotionPhoto || tags.MicroVideo) || this.isJpeg(asset.originalPath, tags))
+    );
+  }
+
+  private isJpeg(path: string, tags: ImmichTags) {
+    const extension = parse(path).ext.toLowerCase();
+    return tags.FileType === 'JPEG' || extension === '.jpg' || extension === '.jpeg' || extension === '.jpe';
+  }
+
+  private isJpegEnd(buffer: Buffer) {
+    return buffer[0] === JPEG_END_MARKER[0] && buffer[1] === JPEG_END_MARKER[1];
+  }
+
+  private isMp4Brand(brand: string) {
+    return MP4_BRANDS.some((prefix) => brand.startsWith(prefix));
+  }
+
+  private isMp4BoxType(type: string) {
+    return [...type].every((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code >= 0x20 && code <= 0x7e;
+    });
+  }
+
+  private findTopLevelMp4Boxes(buffer: Buffer, start: number) {
+    const boxes = new Set<string>();
+    let offset = start;
+
+    while (offset + 8 <= buffer.byteLength) {
+      let headerSize = 8;
+      let size = buffer.readUInt32BE(offset);
+      const type = buffer.toString('ascii', offset + 4, offset + 8);
+      if (!this.isMp4BoxType(type)) {
+        break;
+      }
+
+      if (size === 1) {
+        if (offset + 16 > buffer.byteLength) {
+          break;
+        }
+
+        headerSize = 16;
+        const largeSize = buffer.readBigUInt64BE(offset + 8);
+        if (largeSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+          break;
+        }
+
+        size = Number(largeSize);
+      } else if (size === 0) {
+        size = buffer.byteLength - offset;
+      }
+
+      if (size < headerSize || offset + size > buffer.byteLength) {
+        break;
+      }
+
+      boxes.add(type);
+      offset += size;
+    }
+
+    return boxes;
+  }
+
+  private findTrailingMp4Start(buffer: Buffer) {
+    let offset = 4;
+
+    while (offset < buffer.byteLength - 8) {
+      const ftyp = buffer.indexOf('ftyp', offset, 'ascii');
+      if (ftyp === -1) {
+        return null;
+      }
+
+      const boxStart = ftyp - 4;
+      if (boxStart < 0) {
+        offset = ftyp + 4;
+        continue;
+      }
+
+      const boxSize = buffer.readUInt32BE(boxStart);
+      const brand = buffer.toString('ascii', ftyp + 4, ftyp + 8);
+      const compatibleBrands = buffer.toString('ascii', ftyp + 12, Math.min(boxStart + boxSize, buffer.byteLength));
+      const imageEnd = buffer.lastIndexOf(JPEG_END_MARKER, boxStart);
+      const privateBytes = imageEnd === -1 ? Infinity : boxStart - imageEnd - JPEG_END_MARKER.byteLength;
+
+      if (
+        boxSize >= 16 &&
+        boxStart + boxSize <= buffer.byteLength &&
+        (this.isMp4Brand(brand) || MP4_BRANDS.some((mp4Brand) => compatibleBrands.includes(mp4Brand))) &&
+        privateBytes >= 0 &&
+        privateBytes <= MAX_TRAILING_MP4_PRIVATE_BYTES
+      ) {
+        const boxes = this.findTopLevelMp4Boxes(buffer, boxStart);
+        if (boxes.has('moov') && boxes.has('mdat')) {
+          return boxStart;
+        }
+      }
+
+      offset = ftyp + 4;
+    }
+
+    return null;
+  }
+
+  private async extractTrailingMp4(path: string, stats: Stats) {
+    if (stats.size < JPEG_END_MARKER.byteLength) {
+      return null;
+    }
+
+    const end = await this.storageRepository.readFile(path, {
+      buffer: Buffer.alloc(JPEG_END_MARKER.byteLength),
+      position: stats.size - JPEG_END_MARKER.byteLength,
+      length: JPEG_END_MARKER.byteLength,
+    });
+
+    if (this.isJpegEnd(end)) {
+      return null;
+    }
+
+    const length = Math.min(stats.size, MAX_TRAILING_MP4_SCAN_BYTES);
+    const position = stats.size - length;
+    const tail = await this.storageRepository.readFile(path, {
+      buffer: Buffer.alloc(length),
+      position,
+      length,
+    });
+    const mp4Start = this.findTrailingMp4Start(tail);
+
+    return mp4Start === null ? null : tail.subarray(mp4Start);
   }
 
   private async applyMotionPhotos(asset: Asset, tags: ImmichTags, dates: Dates, stats: Stats) {
@@ -633,11 +766,10 @@ export class MetadataService extends BaseService {
       length = videoOffset;
     }
 
-    if (!length && !hasEmbeddedVideoFile && !hasMotionPhotoVideo) {
+    const canExtractTrailingMp4 = this.isJpeg(asset.originalPath, tags);
+    if (!length && !hasEmbeddedVideoFile && !hasMotionPhotoVideo && !canExtractTrailingMp4) {
       return;
     }
-
-    this.logger.debug(`Starting motion photo video extraction for asset ${asset.id}: ${asset.originalPath}`);
 
     try {
       const position = stats.size - length - padding;
@@ -652,13 +784,23 @@ export class MetadataService extends BaseService {
         video = await this.metadataRepository.extractBinaryTag(asset.originalPath, 'EmbeddedVideoFile');
       }
       // Default video extraction
-      else {
+      else if (length) {
         video = await this.storageRepository.readFile(asset.originalPath, {
           buffer: Buffer.alloc(length),
           position,
           length,
         });
       }
+      // Some Android vendors and chat apps store motion photos as JPEG data followed by a raw MP4 trailer.
+      else {
+        const trailingMp4 = await this.extractTrailingMp4(asset.originalPath, stats);
+        if (!trailingMp4) {
+          return;
+        }
+
+        video = trailingMp4;
+      }
+      this.logger.debug(`Found motion photo video for asset ${asset.id}: ${asset.originalPath}`);
       const checksum = this.cryptoRepository.hashSha1(video);
       const checksumQuery = { ownerId: asset.ownerId, libraryId: asset.libraryId ?? undefined, checksum };
 
